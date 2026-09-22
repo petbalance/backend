@@ -1,4 +1,4 @@
-"""Copy existing local SQLite databases to the WooAeyoung paths without data loss.
+"""Copy existing local SQLite databases to the PetBalance paths without data loss.
 
 Old files are retained as rollback copies. Stop application servers before running.
 An existing destination is never overwritten.
@@ -9,11 +9,11 @@ import sqlite3
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = (
-    'backend/db/petbalance.db',
-    'backend-spring/db/petbalance-spring.db',
-    'petbalance-spring.db',
-    'db/petbalance.db',
-    '.runtime/share/petbalance.db',
+    'backend/db/wooaeyoung.db',
+    'backend-spring/db/wooaeyoung-spring.db',
+    'wooaeyoung-spring.db',
+    'db/wooaeyoung.db',
+    '.runtime/share/wooaeyoung.db',
 )
 
 
@@ -48,7 +48,7 @@ if __name__ == '__main__':
         source = ROOT / relative
         if not source.exists():
             continue
-        destination = source.with_name(source.name.replace('petbalance', 'wooaeyoung'))
+        destination = source.with_name(source.name.replace('wooaeyoung', 'petbalance'))
         if destination.exists():
             print(f'SKIP existing: {destination.relative_to(ROOT)}')
             continue

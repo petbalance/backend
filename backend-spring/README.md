@@ -1,4 +1,4 @@
-# backend-spring — 우애영, Spring Boot 포트
+# backend-spring — petbalance, Spring Boot 포트
 
 기존 `backend/`(FastAPI, Python)를 Java/Spring Boot로 마이그레이션한 버전입니다.
 Python 백엔드는 그대로 두고, 별도 모듈(`backend-spring/`)로 추가했습니다 — 포트도
@@ -88,8 +88,8 @@ curl -X POST http://127.0.0.1:8757/api/session/analyze \
 
 ## 참고
 
-- 데이터베이스: `db/wooaeyoung-spring.db` (SQLite, users/sessions만 — Python 쪽
-  `db/wooaeyoung.db`와 별도 파일이라 서로 건드리지 않습니다).
+- 데이터베이스: `db/petbalance-spring.db` (SQLite, users/sessions만 — Python 쪽
+  `db/petbalance.db`와 별도 파일이라 서로 건드리지 않습니다).
 - 카탈로그는 `data/processed/*.csv`를 매번 다시 읽는 대신, 빌드 시점에
   `src/main/resources/data/`로 복사해 넣었습니다. 원본 CSV가 바뀌면 다시
   복사해야 합니다.

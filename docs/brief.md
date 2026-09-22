@@ -1,4 +1,4 @@
-# 우애영 MVP Brief
+# petbalance MVP Brief
 
 ## 문제
 

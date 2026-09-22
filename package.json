@@ -1,11 +1,11 @@
 {
-  "name": "wooaeyoung-ai",
-  "productName": "우애영",
+  "name": "petbalance-ai",
+  "productName": "petbalance",
   "version": "0.2.0",
   "private": true,
   "description": "여러 제품을 하나의 식단으로 계산하는 성견 영양 의사결정 보조 데스크톱 앱",
   "main": "desktop/main.js",
-  "author": "우애영",
+  "author": "petbalance",
   "scripts": {
     "postinstall": "cd frontend && npm install",
     "setup": "npm install && node node_modules/electron/install.js",
@@ -13,9 +13,9 @@
     "frontend:dev": "cd frontend && npm run dev",
     "frontend:build": "cd frontend && npm run build",
     "dev": "concurrently -k -n api,ui -c blue,magenta \"npm:backend\" \"npm:frontend:dev\"",
-    "dev:app": "concurrently -k -n api,ui,app \"npm:backend\" \"npm:frontend:dev\" \"wait-on http-get://127.0.0.1:5173 && cross-env WOOAEYOUNG_VITE=1 electron .\"",
+    "dev:app": "concurrently -k -n api,ui,app \"npm:backend\" \"npm:frontend:dev\" \"wait-on http-get://127.0.0.1:5173 && cross-env PETBALANCE_VITE=1 electron .\"",
     "start": "npm run frontend:build && electron .",
-    "backend:freeze": "pyinstaller --noconfirm --distpath dist --workpath build/.pyinstaller build/wooaeyoung-backend.spec",
+    "backend:freeze": "pyinstaller --noconfirm --distpath dist --workpath build/.pyinstaller build/petbalance-backend.spec",
     "dist": "npm run frontend:build && npm run backend:freeze && electron-builder"
   },
   "devDependencies": {
@@ -26,8 +26,8 @@
     "wait-on": "^8.0.1"
   },
   "build": {
-    "appId": "ai.wooaeyoung.desktop",
-    "productName": "우애영",
+    "appId": "ai.petbalance.desktop",
+    "productName": "petbalance",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -38,14 +38,14 @@
     ],
     "extraResources": [
       {
-        "from": "dist/wooaeyoung-backend",
+        "from": "dist/petbalance-backend",
         "to": "backend",
         "filter": ["**/*"]
       }
     ],
     "win": {
       "target": ["nsis"],
-      "artifactName": "WooAeyoung-Setup-${version}.${ext}"
+      "artifactName": "PetBalance-Setup-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,

@@ -34,3 +34,7 @@ build/.pyinstaller/
 .runtime/
 
 .env*
+
+# Separate repositories published alongside this application
+/github-profile-repo/
+/output/frontend-design/
