@@ -1237,3 +1237,143 @@ def api_delete_feeding_record(pet_id: int, record_id: int, db: str | None = Quer
 
 if _spa_fallback_route is not None:
     APP.router.routes.append(_spa_fallback_route)
+
+
+# ---------------------------------------------------------------------------
+# 분석 이력 저장·비교 (FR-19)
+# ---------------------------------------------------------------------------
+_history_fallback_route = next((route for route in APP.router.routes if getattr(route, "path", "") == "/{path:path}"), None)
+if _history_fallback_route is not None:
+    APP.router.routes.remove(_history_fallback_route)
+
+
+class AnalysisSnapshotIn(BaseModel):
+    profile: dict[str, Any]
+    selections: list[dict[str, Any]]
+    summary: list[dict[str, Any]]
+    standards_version: str = ""
+    analyzed_at: str
+
+
+def _analysis_history_connection(db_path: Path):
+    connection = _feeding_records_connection(db_path)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_snapshots (
+            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pet_id INTEGER NOT NULL,
+            analyzed_at TEXT NOT NULL,
+            standards_version TEXT NOT NULL DEFAULT '',
+            profile_json TEXT NOT NULL,
+            selections_json TEXT NOT NULL,
+            summary_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    return connection
+
+
+@APP.post("/api/pets/{pet_id}/analysis-history", status_code=201)
+def api_save_analysis_snapshot(
+    pet_id: int,
+    snapshot: AnalysisSnapshotIn,
+    db: str | None = Query(None),
+):
+    """분석 당시의 프로필·급여 조합·기준·요약 결과를 변경 불가능한 이력으로 저장한다."""
+    db_path = _db_path_from_query(db)
+    if get_pet(pet_id, db_path=db_path) is None:
+        raise HTTPException(404, "펫을 찾을 수 없습니다")
+    with _analysis_history_connection(db_path) as connection:
+        cursor = connection.execute(
+            "INSERT INTO analysis_snapshots (pet_id, analyzed_at, standards_version, profile_json, selections_json, summary_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                pet_id,
+                snapshot.analyzed_at,
+                snapshot.standards_version,
+                json.dumps(snapshot.profile, ensure_ascii=False),
+                json.dumps(snapshot.selections, ensure_ascii=False),
+                json.dumps(snapshot.summary, ensure_ascii=False),
+            ),
+        )
+        row = connection.execute("SELECT * FROM analysis_snapshots WHERE snapshot_id = ?", (cursor.lastrowid,)).fetchone()
+    return _analysis_snapshot_payload(row)
+
+
+def _analysis_snapshot_payload(row) -> dict[str, Any]:
+    payload = dict(row)
+    for key in ("profile_json", "selections_json", "summary_json"):
+        payload[key.removesuffix("_json")] = json.loads(payload.pop(key))
+    return payload
+
+
+@APP.get("/api/pets/{pet_id}/analysis-history")
+def api_list_analysis_history(
+    pet_id: int,
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+    db: str | None = Query(None),
+):
+    """기간별 분석 이력을 최신 순으로 조회한다."""
+    db_path = _db_path_from_query(db)
+    if get_pet(pet_id, db_path=db_path) is None:
+        raise HTTPException(404, "펫을 찾을 수 없습니다")
+    with _analysis_history_connection(db_path) as connection:
+        clauses = ["pet_id = ?"]
+        values: list[Any] = [pet_id]
+        if start:
+            clauses.append("analyzed_at >= ?")
+            values.append(start)
+        if end:
+            clauses.append("analyzed_at <= ?")
+            values.append(end)
+        rows = connection.execute(
+            f"SELECT * FROM analysis_snapshots WHERE {' AND '.join(clauses)} ORDER BY analyzed_at DESC, snapshot_id DESC",
+            values,
+        ).fetchall()
+    return {"items": [_analysis_snapshot_payload(row) for row in rows]}
+
+
+def _summary_by_nutrient(summary: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {str(item.get("nutrient", item.get("name", ""))): item for item in summary if item.get("nutrient", item.get("name"))}
+
+
+@APP.get("/api/pets/{pet_id}/analysis-history/compare")
+def api_compare_analysis_snapshots(
+    pet_id: int,
+    before_id: int,
+    after_id: int,
+    db: str | None = Query(None),
+):
+    """두 분석 이력의 영양소 수치와 상태 변화를 반환한다."""
+    db_path = _db_path_from_query(db)
+    with _analysis_history_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM analysis_snapshots WHERE pet_id = ? AND snapshot_id IN (?, ?)",
+            (pet_id, before_id, after_id),
+        ).fetchall()
+    snapshots = {row["snapshot_id"]: _analysis_snapshot_payload(row) for row in rows}
+    if before_id not in snapshots or after_id not in snapshots:
+        raise HTTPException(404, "비교할 분석 이력을 찾을 수 없습니다")
+    before = snapshots[before_id]
+    after = snapshots[after_id]
+    before_map = _summary_by_nutrient(before["summary"])
+    after_map = _summary_by_nutrient(after["summary"])
+    changes = []
+    for nutrient in sorted(set(before_map) | set(after_map)):
+        old = before_map.get(nutrient, {})
+        new = after_map.get(nutrient, {})
+        old_amount = float(old.get("total_mg", old.get("daily_intake_mg", old.get("amount_mg", 0))) or 0)
+        new_amount = float(new.get("total_mg", new.get("daily_intake_mg", new.get("amount_mg", 0))) or 0)
+        changes.append({
+            "nutrient": nutrient,
+            "before": old,
+            "after": new,
+            "amount_delta_mg": new_amount - old_amount,
+            "status_changed": old.get("status") != new.get("status"),
+        })
+    return {"before": before, "after": after, "changes": changes}
+
+
+if _history_fallback_route is not None:
+    APP.router.routes.append(_history_fallback_route)
