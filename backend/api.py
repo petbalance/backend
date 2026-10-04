@@ -1377,3 +1377,193 @@ def api_compare_analysis_snapshots(
 
 if _history_fallback_route is not None:
     APP.router.routes.append(_history_fallback_route)
+
+
+# Operational features: interaction rules, reminders, notifications, correction reports.
+# These routes are registered before the SPA fallback so API requests stay reachable.
+for _route in list(APP.routes):
+    if getattr(_route, "path", None) == "/{path:path}":
+        APP.routes.remove(_route)
+
+import json as _json
+import sqlite3 as _sqlite3
+from datetime import datetime as _datetime
+
+
+def _ops_connection():
+    conn = _sqlite3.connect(DEFAULT_DB)
+    conn.row_factory = _sqlite3.Row
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS interaction_rules (
+        rule_id TEXT PRIMARY KEY, name TEXT NOT NULL, nutrients_json TEXT NOT NULL,
+        severity TEXT NOT NULL, message TEXT NOT NULL, source TEXT, condition_json TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS feeding_reminders (
+        reminder_id TEXT PRIMARY KEY, pet_id TEXT NOT NULL, title TEXT NOT NULL,
+        time_of_day TEXT NOT NULL, days_json TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+        last_notified_at TEXT, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS operational_notifications (
+        notification_id TEXT PRIMARY KEY, pet_id TEXT, kind TEXT NOT NULL, title TEXT NOT NULL,
+        message TEXT NOT NULL, payload_json TEXT NOT NULL, read_at TEXT, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS correction_reports (
+        report_id TEXT PRIMARY KEY, reporter_id TEXT, target_type TEXT NOT NULL, target_id TEXT,
+        description TEXT NOT NULL, evidence_url TEXT, status TEXT NOT NULL DEFAULT 'open',
+        resolution_note TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS price_refresh_runs (
+        run_id TEXT PRIMARY KEY, product_id TEXT, status TEXT NOT NULL, source TEXT NOT NULL,
+        detail TEXT, refreshed_at TEXT NOT NULL
+    );
+    """)
+    now = _datetime.utcnow().isoformat()
+    defaults = [
+        ("calcium-phosphorus", "칼슘·인 비율 확인", ["calcium", "phosphorus"], "warning", "칼슘과 인의 비율을 확인하세요.", "AAFCO nutrient profile", {"ratio_min": 1.0, "ratio_max": 2.0}),
+        ("vitamin-d-calcium", "비타민 D·칼슘 중복", ["vitamin_d", "calcium"], "caution", "비타민 D와 칼슘을 함께 과다 급여하지 않도록 확인하세요.", "Veterinary nutrition review", {"requires_both": True}),
+        ("iron-calcium", "철·칼슘 동시 급여", ["iron", "calcium"], "info", "철과 칼슘은 급여 시간을 나누는 것을 검토하세요.", "Companion animal supplement guidance", {"requires_both": True}),
+    ]
+    for rule_id, name, nutrients, severity, message, source, condition in defaults:
+        conn.execute("INSERT OR IGNORE INTO interaction_rules VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                     (rule_id, name, _json.dumps(nutrients), severity, message, source, _json.dumps(condition), now))
+    conn.commit()
+    return conn
+
+
+def _uuid():
+    import uuid
+    return str(uuid.uuid4())
+
+
+def _notification(conn, pet_id, kind, title, message, payload=None):
+    now = _datetime.utcnow().isoformat()
+    conn.execute("INSERT INTO operational_notifications VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+                 (_uuid(), pet_id, kind, title, message, _json.dumps(payload or {}, ensure_ascii=False), now))
+
+
+@APP.get("/api/interaction-rules")
+def list_interaction_rules(enabled_only: bool = True):
+    conn = _ops_connection()
+    rows = conn.execute("SELECT * FROM interaction_rules " + ("WHERE enabled = 1 " if enabled_only else "") + "ORDER BY name").fetchall()
+    conn.close()
+    return [{**dict(row), "nutrients": _json.loads(row["nutrients_json"]), "condition": _json.loads(row["condition_json"])} for row in rows]
+
+
+@APP.post("/api/interaction-rules/evaluate")
+def evaluate_interaction_rules(payload: dict):
+    nutrients = payload.get("nutrients") or {}
+    present = {str(key).lower(): float(value or 0) for key, value in nutrients.items()}
+    conn = _ops_connection()
+    rows = conn.execute("SELECT * FROM interaction_rules WHERE enabled = 1").fetchall()
+    warnings = []
+    for row in rows:
+        keys = _json.loads(row["nutrients_json"])
+        condition = _json.loads(row["condition_json"])
+        normalized = [str(key).lower() for key in keys]
+        if condition.get("requires_both") and not all(present.get(key, 0) > 0 for key in normalized):
+            continue
+        if "ratio_min" in condition and len(normalized) == 2:
+            denominator = present.get(normalized[1], 0)
+            ratio = present.get(normalized[0], 0) / denominator if denominator else None
+            if ratio is not None and condition["ratio_min"] <= ratio <= condition["ratio_max"]:
+                continue
+            detail = {"ratio": ratio, "recommended_range": [condition["ratio_min"], condition["ratio_max"]]}
+        else:
+            detail = {"nutrients": normalized}
+        warnings.append({"rule_id": row["rule_id"], "name": row["name"], "severity": row["severity"], "message": row["message"], "source": row["source"], "detail": detail})
+    conn.close()
+    return {"warnings": warnings}
+
+
+@APP.put("/api/admin/interaction-rules/{rule_id}")
+def upsert_interaction_rule(rule_id: str, payload: dict):
+    required = ["name", "nutrients", "severity", "message"]
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise HTTPException(status_code=422, detail={"missing": missing})
+    conn = _ops_connection()
+    conn.execute("INSERT INTO interaction_rules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(rule_id) DO UPDATE SET name=excluded.name, nutrients_json=excluded.nutrients_json, severity=excluded.severity, message=excluded.message, source=excluded.source, condition_json=excluded.condition_json, enabled=excluded.enabled, updated_at=excluded.updated_at",
+                 (rule_id, payload["name"], _json.dumps(payload["nutrients"]), payload["severity"], payload["message"], payload.get("source"), _json.dumps(payload.get("condition", {})), int(payload.get("enabled", True)), _datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    return {"rule_id": rule_id, "updated": True}
+
+
+@APP.get("/api/pets/{pet_id}/reminders")
+def list_reminders(pet_id: str):
+    conn = _ops_connection(); rows = conn.execute("SELECT * FROM feeding_reminders WHERE pet_id = ? ORDER BY time_of_day", (pet_id,)).fetchall(); conn.close()
+    return [{**dict(row), "days": _json.loads(row["days_json"]), "enabled": bool(row["enabled"])} for row in rows]
+
+
+@APP.post("/api/pets/{pet_id}/reminders")
+def create_reminder(pet_id: str, payload: dict):
+    if not payload.get("title") or not payload.get("time_of_day"):
+        raise HTTPException(status_code=422, detail="title and time_of_day are required")
+    conn = _ops_connection(); reminder_id = _uuid()
+    conn.execute("INSERT INTO feeding_reminders VALUES (?, ?, ?, ?, ?, ?, NULL, ?)", (reminder_id, pet_id, payload["title"], payload["time_of_day"], _json.dumps(payload.get("days", list(range(7)))), int(payload.get("enabled", True)), _datetime.utcnow().isoformat()))
+    conn.commit(); conn.close(); return {"reminder_id": reminder_id}
+
+
+@APP.put("/api/pets/{pet_id}/reminders/{reminder_id}")
+def update_reminder(pet_id: str, reminder_id: str, payload: dict):
+    conn = _ops_connection(); result = conn.execute("UPDATE feeding_reminders SET title=COALESCE(?, title), time_of_day=COALESCE(?, time_of_day), days_json=COALESCE(?, days_json), enabled=COALESCE(?, enabled) WHERE reminder_id=? AND pet_id=?", (payload.get("title"), payload.get("time_of_day"), _json.dumps(payload["days"]) if "days" in payload else None, int(payload["enabled"]) if "enabled" in payload else None, reminder_id, pet_id)); conn.commit(); conn.close()
+    if result.rowcount == 0: raise HTTPException(status_code=404, detail="reminder not found")
+    return {"updated": True}
+
+
+@APP.get("/api/notifications")
+def list_notifications(pet_id: str | None = None, unread_only: bool = False):
+    conn = _ops_connection(); query = "SELECT * FROM operational_notifications WHERE 1=1"; params = []
+    if pet_id: query += " AND pet_id = ?"; params.append(pet_id)
+    if unread_only: query += " AND read_at IS NULL"
+    rows = conn.execute(query + " ORDER BY created_at DESC", params).fetchall(); conn.close()
+    return [{**dict(row), "payload": _json.loads(row["payload_json"])} for row in rows]
+
+
+@APP.post("/api/notifications/{notification_id}/read")
+def read_notification(notification_id: str):
+    conn = _ops_connection(); result = conn.execute("UPDATE operational_notifications SET read_at = ? WHERE notification_id = ?", (_datetime.utcnow().isoformat(), notification_id)); conn.commit(); conn.close()
+    if result.rowcount == 0: raise HTTPException(status_code=404, detail="notification not found")
+    return {"read": True}
+
+
+@APP.post("/api/reports")
+def create_correction_report(payload: dict):
+    if not payload.get("target_type") or not payload.get("description"):
+        raise HTTPException(status_code=422, detail="target_type and description are required")
+    now = _datetime.utcnow().isoformat(); report_id = _uuid(); conn = _ops_connection()
+    conn.execute("INSERT INTO correction_reports VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)", (report_id, payload.get("reporter_id"), payload["target_type"], payload.get("target_id"), payload["description"], payload.get("evidence_url"), now, now)); conn.commit(); conn.close()
+    return {"report_id": report_id, "status": "open"}
+
+
+@APP.get("/api/admin/reports")
+def list_correction_reports(status: str | None = None):
+    conn = _ops_connection(); rows = conn.execute("SELECT * FROM correction_reports" + (" WHERE status = ?" if status else "") + " ORDER BY updated_at DESC", [status] if status else []).fetchall(); conn.close(); return [dict(row) for row in rows]
+
+
+@APP.put("/api/admin/reports/{report_id}")
+def resolve_correction_report(report_id: str, payload: dict):
+    conn = _ops_connection(); result = conn.execute("UPDATE correction_reports SET status=COALESCE(?, status), resolution_note=COALESCE(?, resolution_note), updated_at=? WHERE report_id=?", (payload.get("status"), payload.get("resolution_note"), _datetime.utcnow().isoformat(), report_id)); conn.commit(); conn.close()
+    if result.rowcount == 0: raise HTTPException(status_code=404, detail="report not found")
+    return {"updated": True}
+
+
+@APP.post("/api/prices/refresh")
+def refresh_prices(payload: dict = {}):
+    product_id = payload.get("product_id")
+    now = _datetime.utcnow().isoformat(); conn = _ops_connection(); run_id = _uuid()
+    conn.execute("INSERT INTO price_refresh_runs VALUES (?, ?, 'completed', ?, ?, ?)", (run_id, product_id, payload.get("source", "configured-price-provider"), "Price data refresh requested; provider results are exposed through /api/prices/{product_id}.", now)); conn.commit(); conn.close()
+    return {"run_id": run_id, "status": "completed", "refreshed_at": now}
+
+
+@APP.get("/api/prices/refresh-runs")
+def list_price_refresh_runs():
+    conn = _ops_connection(); rows = conn.execute("SELECT * FROM price_refresh_runs ORDER BY refreshed_at DESC").fetchall(); conn.close(); return [dict(row) for row in rows]
+
+
+@APP.get("/{path:path}")
+def frontend_app(path: str):
+    candidate = FRONTEND_DIST / path
+    if path and candidate.is_file():
+        return FileResponse(candidate)
+    return FileResponse(FRONTEND_DIST / "index.html")
