@@ -1106,3 +1106,134 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# 실제 급여 기록 (FR-17)
+# ---------------------------------------------------------------------------
+# SPA fallback보다 API 라우트를 먼저 매칭한다.
+_spa_fallback_route = next((route for route in APP.router.routes if getattr(route, "path", "") == "/{path:path}"), None)
+if _spa_fallback_route is not None:
+    APP.router.routes.remove(_spa_fallback_route)
+
+
+class FeedingRecordIn(BaseModel):
+    product_id: str
+    actual_amount_g: float = Field(ge=0)
+    fed_at: str
+    memo: str = Field(default="", max_length=1000)
+
+
+def _feeding_records_connection(db_path: Path):
+    """실제 급여 기록 테이블을 보장하고 SQLite 연결을 연다."""
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feeding_records (
+            record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pet_id INTEGER NOT NULL,
+            product_id TEXT NOT NULL,
+            actual_amount_g REAL NOT NULL CHECK(actual_amount_g >= 0),
+            fed_at TEXT NOT NULL,
+            memo TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    return connection
+
+
+def _feeding_record_payload(row) -> dict[str, Any]:
+    return dict(row)
+
+
+@APP.get("/api/pets/{pet_id}/feeding-records")
+def api_list_feeding_records(
+    pet_id: int,
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+    db: str | None = Query(None),
+):
+    """날짜 구간의 실제 급여 기록을 최신 순으로 조회한다."""
+    db_path = _db_path_from_query(db)
+    if get_pet(pet_id, db_path=db_path) is None:
+        raise HTTPException(404, "펫을 찾을 수 없습니다")
+    with _feeding_records_connection(db_path) as connection:
+        clauses = ["pet_id = ?"]
+        values: list[Any] = [pet_id]
+        if start:
+            clauses.append("fed_at >= ?")
+            values.append(start)
+        if end:
+            clauses.append("fed_at <= ?")
+            values.append(end)
+        rows = connection.execute(
+            f"SELECT * FROM feeding_records WHERE {' AND '.join(clauses)} ORDER BY fed_at DESC, record_id DESC",
+            values,
+        ).fetchall()
+    return {"items": [_feeding_record_payload(row) for row in rows]}
+
+
+@APP.post("/api/pets/{pet_id}/feeding-records", status_code=201)
+def api_create_feeding_record(
+    pet_id: int,
+    record: FeedingRecordIn,
+    db: str | None = Query(None),
+):
+    """실제 급여량·시각·메모를 한 건 저장한다."""
+    db_path = _db_path_from_query(db)
+    if get_pet(pet_id, db_path=db_path) is None:
+        raise HTTPException(404, "펫을 찾을 수 없습니다")
+    if get_product(record.product_id, db_path=db_path) is None:
+        raise HTTPException(404, "제품을 찾을 수 없습니다")
+    with _feeding_records_connection(db_path) as connection:
+        cursor = connection.execute(
+            "INSERT INTO feeding_records (pet_id, product_id, actual_amount_g, fed_at, memo) VALUES (?, ?, ?, ?, ?)",
+            (pet_id, record.product_id, record.actual_amount_g, record.fed_at, record.memo.strip()),
+        )
+        row = connection.execute("SELECT * FROM feeding_records WHERE record_id = ?", (cursor.lastrowid,)).fetchone()
+    return _feeding_record_payload(row)
+
+
+@APP.put("/api/pets/{pet_id}/feeding-records/{record_id}")
+def api_update_feeding_record(
+    pet_id: int,
+    record_id: int,
+    record: FeedingRecordIn,
+    db: str | None = Query(None),
+):
+    """기존 실제 급여 기록을 수정한다."""
+    db_path = _db_path_from_query(db)
+    if get_pet(pet_id, db_path=db_path) is None:
+        raise HTTPException(404, "펫을 찾을 수 없습니다")
+    if get_product(record.product_id, db_path=db_path) is None:
+        raise HTTPException(404, "제품을 찾을 수 없습니다")
+    with _feeding_records_connection(db_path) as connection:
+        cursor = connection.execute(
+            "UPDATE feeding_records SET product_id = ?, actual_amount_g = ?, fed_at = ?, memo = ?, updated_at = CURRENT_TIMESTAMP WHERE record_id = ? AND pet_id = ?",
+            (record.product_id, record.actual_amount_g, record.fed_at, record.memo.strip(), record_id, pet_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "급여 기록을 찾을 수 없습니다")
+        row = connection.execute("SELECT * FROM feeding_records WHERE record_id = ?", (record_id,)).fetchone()
+    return _feeding_record_payload(row)
+
+
+@APP.delete("/api/pets/{pet_id}/feeding-records/{record_id}", status_code=204)
+def api_delete_feeding_record(pet_id: int, record_id: int, db: str | None = Query(None)):
+    """실제 급여 기록을 삭제한다."""
+    db_path = _db_path_from_query(db)
+    with _feeding_records_connection(db_path) as connection:
+        cursor = connection.execute("DELETE FROM feeding_records WHERE record_id = ? AND pet_id = ?", (record_id, pet_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "급여 기록을 찾을 수 없습니다")
+    return None
+
+
+if _spa_fallback_route is not None:
+    APP.router.routes.append(_spa_fallback_route)
