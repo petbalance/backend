@@ -1618,3 +1618,59 @@ def frontend_app(path: str):
     if path and candidate.is_file():
         return FileResponse(candidate)
     return FileResponse(FRONTEND_DIST / "index.html")
+
+
+# Account recovery and lifecycle endpoints (FR-12/FR-13).
+for _route in list(APP.routes):
+    if getattr(_route, "path", None) == "/{path:path}":
+        APP.routes.remove(_route)
+
+class PasswordResetRequest(BaseModel):
+    email: str
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: str
+
+
+@APP.post("/api/auth/password-reset/request")
+def api_password_reset_request(req: PasswordResetRequest, db: str | None = Query(None)):
+    result = auth_mod.create_password_reset(req.email, db_path=_db_path_from_query(db))
+    # Mail delivery is deployment-specific; local/desktop clients can present this token as a reset link.
+    return {"requested": True, "token": result["token"], "expires_at": result["expires_at"]}
+
+
+@APP.post("/api/auth/password-reset/confirm")
+def api_password_reset_confirm(req: PasswordResetConfirmRequest, db: str | None = Query(None)):
+    try:
+        auth_mod.reset_password(req.token, req.new_password, db_path=_db_path_from_query(db))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"reset": True}
+
+
+@APP.patch("/api/auth/me")
+def api_update_profile(req: ProfileUpdateRequest, db: str | None = Query(None), user: dict[str, Any] = Depends(current_user)):
+    try:
+        return auth_mod.update_profile(user["user_id"], req.display_name, db_path=_db_path_from_query(db))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@APP.delete("/api/auth/me")
+def api_delete_account(db: str | None = Query(None), user: dict[str, Any] = Depends(current_user)):
+    auth_mod.delete_account(user["user_id"], db_path=_db_path_from_query(db))
+    return {"deleted": True}
+
+
+@APP.get("/{path:path}")
+def frontend_app(path: str):
+    candidate = FRONTEND_DIST / path
+    if path and candidate.is_file():
+        return FileResponse(candidate)
+    return FileResponse(FRONTEND_DIST / "index.html")
