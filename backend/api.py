@@ -1567,3 +1567,54 @@ def frontend_app(path: str):
     if path and candidate.is_file():
         return FileResponse(candidate)
     return FileResponse(FRONTEND_DIST / "index.html")
+
+
+# Recommendation preview/apply: keep proposed changes reviewable before persisting them.
+for _route in list(APP.routes):
+    if getattr(_route, "path", None) == "/{path:path}":
+        APP.routes.remove(_route)
+
+@APP.post("/api/recommendations/preview")
+def recommendation_preview(payload: dict):
+    before = payload.get("current_plan") or []
+    additions = payload.get("additions") or []
+    removals = set(payload.get("remove_product_ids") or [])
+    after = [item for item in before if str(item.get("product_id")) not in removals] + additions
+    before_total = payload.get("before_summary") or {}
+    after_total = dict(before_total)
+    for item in additions:
+        for key, value in (item.get("nutrients") or {}).items():
+            after_total[key] = float(after_total.get(key, 0) or 0) + float(value or 0)
+    for item in before:
+        if str(item.get("product_id")) in removals:
+            for key, value in (item.get("nutrients") or {}).items():
+                after_total[key] = float(after_total.get(key, 0) or 0) - float(value or 0)
+    return {"before": before, "after": after, "before_summary": before_total, "after_summary": after_total, "requires_confirmation": True}
+
+
+@APP.post("/api/pets/{pet_id}/recommendations/apply")
+def apply_recommendation(pet_id: str, payload: dict):
+    conn = _ops_connection()
+    conn.execute("CREATE TABLE IF NOT EXISTS feeding_plan_overrides (override_id TEXT PRIMARY KEY, pet_id TEXT NOT NULL, plan_json TEXT NOT NULL, applied_at TEXT NOT NULL)")
+    override_id = _uuid(); now = _datetime.utcnow().isoformat()
+    plan = payload.get("plan") or []
+    conn.execute("INSERT INTO feeding_plan_overrides VALUES (?, ?, ?, ?)", (override_id, pet_id, _json.dumps(plan, ensure_ascii=False), now))
+    _notification(conn, pet_id, "plan_updated", "급여 계획이 변경되었습니다", "추천 조합을 확인하고 급여 계획에 적용했습니다.", {"override_id": override_id})
+    conn.commit(); conn.close()
+    return {"override_id": override_id, "pet_id": pet_id, "plan": plan, "applied_at": now}
+
+
+@APP.get("/api/pets/{pet_id}/recommendations/applied")
+def latest_applied_recommendation(pet_id: str):
+    conn = _ops_connection(); conn.execute("CREATE TABLE IF NOT EXISTS feeding_plan_overrides (override_id TEXT PRIMARY KEY, pet_id TEXT NOT NULL, plan_json TEXT NOT NULL, applied_at TEXT NOT NULL)")
+    row = conn.execute("SELECT * FROM feeding_plan_overrides WHERE pet_id = ? ORDER BY applied_at DESC LIMIT 1", (pet_id,)).fetchone(); conn.close()
+    if not row: return {"pet_id": pet_id, "plan": None}
+    return {"override_id": row["override_id"], "pet_id": pet_id, "plan": _json.loads(row["plan_json"]), "applied_at": row["applied_at"]}
+
+
+@APP.get("/{path:path}")
+def frontend_app(path: str):
+    candidate = FRONTEND_DIST / path
+    if path and candidate.is_file():
+        return FileResponse(candidate)
+    return FileResponse(FRONTEND_DIST / "index.html")
