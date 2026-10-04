@@ -141,3 +141,60 @@ def user_for_token(token: str, db_path: Path | None = None) -> dict[str, Any] | 
             "email": row.email,
             "display_name": row.display_name,
         }
+
+
+# Account recovery and lifecycle helpers (FR-12/FR-13).
+def create_password_reset(email: str, db_path: Path | None = None) -> dict[str, Any]:
+    email = email.strip().lower()
+    token = secrets.token_urlsafe(32)
+    expires = (_now() + timedelta(hours=1)).isoformat()
+    with _session(db_path) as conn:
+        row = conn.execute(sa.text("SELECT user_id FROM users WHERE email=:e"), {"e": email}).fetchone()
+        # Do not reveal whether an account exists to callers; only persist a token for a known account.
+        if row is not None:
+            conn.execute(sa.text("CREATE TABLE IF NOT EXISTS password_reset_tokens (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at TEXT NOT NULL, used_at TEXT)"))
+            conn.execute(sa.text("INSERT INTO password_reset_tokens(token, user_id, expires_at) VALUES (:t, :u, :x)"), {"t": token, "u": row.user_id, "x": expires})
+            conn.commit()
+    return {"token": token, "expires_at": expires}
+
+
+def reset_password(token: str, new_password: str, db_path: Path | None = None) -> None:
+    if len(new_password) < 8:
+        raise ValueError("비밀번호는 8자 이상이어야 합니다.")
+    with _session(db_path) as conn:
+        conn.execute(sa.text("CREATE TABLE IF NOT EXISTS password_reset_tokens (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at TEXT NOT NULL, used_at TEXT)"))
+        row = conn.execute(sa.text("SELECT user_id, expires_at, used_at FROM password_reset_tokens WHERE token=:t"), {"t": token}).fetchone()
+        if row is None or row.used_at or datetime.fromisoformat(row.expires_at) < _now():
+            raise ValueError("재설정 토큰이 만료되었거나 올바르지 않습니다.")
+        salt = secrets.token_hex(16)
+        conn.execute(sa.text("UPDATE users SET password_hash=:h, password_salt=:s WHERE user_id=:u"), {"h": _hash_password(new_password, salt), "s": salt, "u": row.user_id})
+        conn.execute(sa.text("UPDATE password_reset_tokens SET used_at=:x WHERE token=:t"), {"x": _now().isoformat(), "t": token})
+        conn.execute(sa.text("DELETE FROM sessions WHERE user_id=:u"), {"u": row.user_id})
+        conn.commit()
+
+
+def update_profile(user_id: int, display_name: str, db_path: Path | None = None) -> dict[str, Any]:
+    name = display_name.strip()
+    if not name:
+        raise ValueError("닉네임을 입력하세요.")
+    with _session(db_path) as conn:
+        conn.execute(sa.text("UPDATE users SET display_name=:n WHERE user_id=:u"), {"n": name, "u": user_id})
+        row = conn.execute(sa.text("SELECT user_id, email, display_name FROM users WHERE user_id=:u"), {"u": user_id}).fetchone()
+        conn.commit()
+    if row is None:
+        raise ValueError("계정을 찾을 수 없습니다.")
+    return {"user_id": row.user_id, "email": row.email, "display_name": row.display_name}
+
+
+def delete_account(user_id: int, db_path: Path | None = None) -> None:
+    with _session(db_path) as conn:
+        conn.execute(sa.text("DELETE FROM sessions WHERE user_id=:u"), {"u": user_id})
+        # Pet and dependent records use user_id where available; keep deletion scoped to this account.
+        for table in ("feeding_records", "analysis_snapshots", "feeding_plan_overrides", "feeding_reminders", "operational_notifications"):
+            try:
+                conn.execute(sa.text(f"DELETE FROM {table} WHERE pet_id IN (SELECT pet_id FROM pets WHERE user_id=:u)"), {"u": user_id})
+            except Exception:
+                pass
+        conn.execute(sa.text("DELETE FROM pets WHERE user_id=:u"), {"u": user_id})
+        conn.execute(sa.text("DELETE FROM users WHERE user_id=:u"), {"u": user_id})
+        conn.commit()
